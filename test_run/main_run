@@ -1,0 +1,600 @@
+
+
+open Printf
+
+(* ---------- Core SAT types ---------- *)
+
+type lit = int * bool          (* (var, neg) *)
+type clause = lit list
+
+type value = Undef | True | False
+
+type assign_record = {
+  mutable value : value;
+  mutable antecedent : clause option;
+  mutable level : int;
+}
+
+let eval_lit ((v, neg) : lit) (assignments : assign_record array) : value =
+  let a = assignments.(v) in
+  match a.value with
+  | Undef -> Undef
+  | True ->
+      if neg then False else True
+  | False ->
+      if neg then True else False
+
+type clause_status =
+  | Satisfied
+  | Unsatisfied
+  | Unit
+  | Unresolved
+
+let clause_status (cl : clause) (assignments : assign_record array) : clause_status =
+  let len = List.length cl in
+  let has_true = ref false in
+  let false_count = ref 0 in
+  List.iter
+    (fun lit ->
+       match eval_lit lit assignments with
+       | True -> has_true := true
+       | False -> incr false_count
+       | Undef -> ())
+    cl;
+  if !has_true then Satisfied
+  else if !false_count = len then Unsatisfied
+  else if !false_count = len - 1 then Unit
+  else Unresolved
+
+type up_result =
+  | UpConflict of clause
+  | UpUnresolved
+
+let unit_propagation
+    (formula_clauses : clause list ref)
+    (assignments : assign_record array)
+    (current_dl : int) : up_result =
+  (* Direct port of Python unit_propagation *)
+  let rec outer () =
+    let finish = ref true in
+    let conflict : clause option ref = ref None in
+
+    let rec loop_clauses cls =
+      match cls with
+      | [] -> ()
+      | cl :: rest ->
+          if !conflict <> None then ()
+          else begin
+            match clause_status cl assignments with
+            | Satisfied | Unresolved ->
+                loop_clauses rest
+            | Unit ->
+                (* Find the unassigned literal *)
+                let rec find_unassigned lits =
+                  match lits with
+                  | [] -> ()
+                  | (v, neg) :: tl ->
+                      if assignments.(v).value = Undef then begin
+                        let val_bool = not neg in
+                        assignments.(v).value <- (if val_bool then True else False);
+                        assignments.(v).antecedent <- Some cl;
+                        assignments.(v).level <- current_dl;
+                        finish := false
+                      end else
+                        find_unassigned tl
+                in
+                find_unassigned cl;
+                loop_clauses rest
+            | Unsatisfied ->
+                conflict := Some cl
+          end
+    in
+
+    loop_clauses !formula_clauses;
+    match !conflict with
+    | Some cl -> UpConflict cl
+    | None ->
+        if not !finish then outer ()
+        else UpUnresolved
+  in
+  outer ()
+
+
+(* resolve(a, b, x): resolution of clauses a and b on variable x *)
+let resolve (a : clause) (b : clause) (x : int) : clause =
+  let module S =
+    Set.Make(struct
+      type t = lit
+      let compare = compare
+    end)
+  in
+  let add_clause s (cl : clause) =
+    List.fold_left
+      (fun acc ((v, _) as lit) ->
+         if v = x then acc else S.add lit acc)
+      s cl
+  in
+  let s = add_clause S.empty a in
+  let s = add_clause s b in
+  S.elements s
+
+
+let literals_at_level (cl : clause)
+                      (assignments : assign_record array)
+                      (dl : int) : clause =
+  List.fold_left
+    (fun acc ((v, _) as lit) ->
+       match assignments.(v).value with
+       | Undef -> acc
+       | True | False ->
+           if assignments.(v).level = dl then lit :: acc else acc)
+    [] cl
+
+
+let conflict_analysis
+    (clause0 : clause)
+    (assignments : assign_record array)
+    (current_dl : int)
+  : int * clause option =
+  (* Direct port of Python conflict_analysis *)
+  if current_dl = 0 then (-1, None)
+  else
+    let rec loop clause =
+      let literals = literals_at_level clause assignments current_dl in
+      if List.length literals <> 1 then begin
+        (* Find implied literals (with antecedents) *)
+        let implied =
+          List.filter
+            (fun (v, _) ->
+               match assignments.(v).antecedent with
+               | Some _ -> true
+               | None -> false)
+            literals
+        in
+        match implied with
+        | [] -> clause
+        | (v, _) :: _ ->
+            let antecedent =
+              match assignments.(v).antecedent with
+              | Some c -> c
+              | None -> []
+            in
+            let clause' = resolve clause antecedent v in
+            loop clause'
+      end else
+        clause
+    in
+    let learnt_clause = loop clause0 in
+
+    (* Compute backtrack level *)
+    let levels =
+      List.fold_left
+        (fun acc (v, _) ->
+           match assignments.(v).value with
+           | Undef -> acc
+           | True | False ->
+               let dl = assignments.(v).level in
+               if List.mem dl acc then acc else dl :: acc)
+        [] learnt_clause
+    in
+    let levels_sorted = List.sort compare levels in
+    let backtrack_level =
+      match levels_sorted with
+      | [] | [_] -> 0
+      | _ ->
+          let rec second_last = function
+            | [] | [_] -> 0
+            | [a; _] -> a
+            | _ :: tl -> second_last tl
+          in
+          second_last levels_sorted
+    in
+    (backtrack_level, Some learnt_clause)
+
+
+let backtrack (assignments : assign_record array) (b : int) : unit =
+  (* Remove assignments with dl > b *)
+  Array.iteri
+    (fun v a ->
+       if v > 0 && a.level > b then begin
+         a.value <- Undef;
+         a.antecedent <- None;
+         a.level <- 0
+       end)
+    assignments
+
+
+let pick_branching_variable (variables : int list)
+                            (assignments : assign_record array)
+  : int * bool =
+  (* Fixed heuristic: first unassigned variable, always True *)
+  let rec aux = function
+    | [] -> failwith "No unassigned variables"
+    | v :: vs ->
+        if assignments.(v).value = Undef then (v, true)
+        else aux vs
+  in
+  aux variables
+
+
+let count_assigned (variables : int list)
+                   (assignments : assign_record array) : int =
+  List.fold_left
+    (fun acc v ->
+       match assignments.(v).value with
+       | Undef -> acc
+       | True | False -> acc + 1)
+    0 variables
+
+
+exception Unsat
+
+
+let solve_sat (num_vars : int) (clauses : int list list)
+  : (int * bool) list option =
+  (* Convert clauses to internal (var,neg) format and collect variables *)
+  let present = Array.make (num_vars + 1) false in
+  let formula_init =
+    List.map
+      (fun clause ->
+         List.map
+           (fun lit ->
+              let var = abs lit in
+              let neg = lit < 0 in
+              if var <= num_vars then present.(var) <- true;
+              (var, neg))
+           clause)
+      clauses
+  in
+  let variables =
+    let rec collect v acc =
+      if v = 0 then acc
+      else
+        if present.(v) then collect (v - 1) (v :: acc)
+        else collect (v - 1) acc
+    in
+    collect num_vars []
+  in
+  let assignments =
+    Array.init (num_vars + 1)
+      (fun _ -> { value = Undef; antecedent = None; level = 0 })
+  in
+  let formula_clauses = ref formula_init in
+  let current_dl = ref 0 in
+
+  let total_vars = List.length variables in
+  let count_assigned () = count_assigned variables assignments in
+
+  try
+    (* Initial unit propagation at decision level 0 *)
+    (match unit_propagation formula_clauses assignments !current_dl with
+     | UpConflict _ -> raise Unsat
+     | UpUnresolved -> ());
+
+    (* Main CDCL loop *)
+    while count_assigned () < total_vars do
+      let (var, value) = pick_branching_variable variables assignments in
+      incr current_dl;
+      assignments.(var).value <- if value then True else False;
+      assignments.(var).antecedent <- None;
+      assignments.(var).level <- !current_dl;
+
+      let rec inner () =
+        match unit_propagation formula_clauses assignments !current_dl with
+        | UpUnresolved -> ()
+        | UpConflict conflict_clause ->
+            let (b, learnt_opt) =
+              conflict_analysis conflict_clause assignments !current_dl
+            in
+            if b < 0 then
+              raise Unsat
+            else begin
+              (match learnt_opt with
+               | Some learnt ->
+                   formula_clauses := learnt :: !formula_clauses
+               | None -> ());
+              backtrack assignments b;
+              current_dl := b;
+              inner ()
+            end
+      in
+      inner ()
+    done;
+
+    (* SAT: convert assignments back to (var, bool) list *)
+    let result =
+      List.fold_left
+        (fun acc v ->
+           match assignments.(v).value with
+           | True -> (v, true) :: acc
+           | False -> (v, false) :: acc
+           | Undef ->
+               (* Should not happen; default to True if it does *)
+               (v, true) :: acc)
+        [] variables
+    in
+    Some result
+
+  with Unsat ->
+    None
+
+
+(* ========================================================= *)
+(*                In-memory test cases 1–6                   *)
+(* ========================================================= *)
+
+(* ---------- Test 1 ---------- *)
+(* (x1 OR x2) AND (¬x1 OR x3) AND (¬x2 OR ¬x3)  -- SAT *)
+
+let test1_num_vars = 3
+let test1_clauses = [
+  [1; 2];
+  [-1; 3];
+  [-2; -3];
+]
+
+(* ---------- Test 2 ---------- *)
+(* (x1 OR x2) AND (¬x1 OR x3) AND (¬x2 OR x4) AND (¬x3 OR ¬x4) AND (x1 AND ¬x1) -- UNSAT *)
+
+let test2_num_vars = 4
+let test2_clauses = [
+  [1; 2];
+  [-1; 3];
+  [-2; 4];
+  [-3; -4];
+  [1];
+  [-1];
+]
+
+(* ---------- Test 3 ---------- *)
+(* Complex UNSAT formula with 20 vars and many clauses        *)
+
+let test3_num_vars = 20
+let test3_clauses = [
+  [1; 2; 3; 4; 5];
+  [-1; 6; 7; 8; 9];
+  [-2; 10; 11; 12; 13];
+  [-3; 14; 15; 16; 17];
+  [-4; 18; 19; 20];
+  [-5; 6; 10; 14; 18];
+  [-6; 7; 11; 15; 19];
+  [-7; 8; 12; 16; 20];
+  [-8; 9; 13; 17];
+  [-9; 10; 14; 18];
+  [-10; 11; 15; 19];
+  [-11; 12; 16; 20];
+  [-12; 13; 17];
+  [-13; 14; 18];
+  [-14; 15; 19];
+  [-15; 16; 20];
+  [-16; 17];
+  [-17; 18];
+  [-18; 19];
+  [-19; 20];
+  [1; 6; 10; 14; 18];
+  [2; 7; 11; 15; 19];
+  [3; 8; 12; 16; 20];
+  [4; 9; 13; 17];
+  [5; 6; 10; 14; 18];
+  [-1; -6];
+  [-2; -7];
+  [-3; -8];
+  [-4; -9];
+  [-5; -10];
+  [-6; -11];
+  [-7; -12];
+  [-8; -13];
+  [-9; -14];
+  [-10; -15];
+  [-11; -16];
+  [-12; -17];
+  [-13; -18];
+  [-14; -19];
+  [-15; -20];
+  [1; 7; 13; 19];
+  [2; 8; 14; 20];
+  [3; 9; 15];
+  [4; 10; 16];
+  [5; 11; 17];
+  [6; 12; 18];
+  [7; 13; 19];
+  [8; 14; 20];
+  [9; 15];
+  [10; 16];
+  [11; 17];
+  [12; 18];
+  [13; 19];
+  [14; 20];
+  [15];
+]
+
+(* ---------- Test 4 ---------- *)
+(* (x1 OR x2) AND (¬x1 OR x3) AND (¬x2 OR x3)  -- SAT *)
+
+let test4_num_vars = 3
+let test4_clauses = [
+  [1; 2];
+  [-1; 3];
+  [-2; 3];
+]
+
+(* ---------- Test 5 ---------- *)
+(* Big SAT-ish construction with 25 vars                      *)
+
+let test5_num_vars = 25
+let test5_clauses = [
+  [1; 2; 3; 4; 5; 6; 7; 8; 9; 10];
+  [-1; 11; 12; 13; 14; 15; 16; 17; 18; 19; 20];
+  [-2; 21; 22; 23; 24; 25];
+  [-3; 11; 21];
+  [-4; 12; 22];
+  [-5; 13; 23];
+  [-6; 14; 24];
+  [-7; 15; 25];
+  [-8; 16; 11];
+  [-9; 17; 12];
+  [-10; 18; 13];
+  [-11; 19; 14];
+  [-12; 20; 15];
+  [-13; 21; 16];
+  [-14; 22; 17];
+  [-15; 23; 18];
+  [-16; 24; 19];
+  [-17; 25; 20];
+  [-18; 11; 21];
+  [-19; 12; 22];
+  [-20; 13; 23];
+  [-21; 14; 24];
+  [-22; 15; 25];
+  [-23; 16; 11];
+  [-24; 17; 12];
+  [-25; 18; 13];
+  [1; 11; 21];
+  [2; 12; 22];
+  [3; 13; 23];
+  [4; 14; 24];
+  [5; 15; 25];
+  [6; 16; 11];
+  [7; 17; 12];
+  [8; 18; 13];
+  [9; 19; 14];
+  [10; 20; 15];
+  [11; 21; 16];
+  [12; 22; 17];
+  [13; 23; 18];
+  [14; 24; 19];
+  [15; 25; 20];
+  [16; 11; 21];
+  [17; 12; 22];
+  [18; 13; 23];
+  [19; 14; 24];
+  [20; 15; 25];
+  [21; 16; 11];
+  [22; 17; 12];
+  [23; 18; 13];
+  [24; 19; 14];
+  [25; 20; 15];
+  [-1; -11];
+  [-2; -12];
+  [-3; -13];
+  [-4; -14];
+  [-5; -15];
+  [-6; -16];
+  [-7; -17];
+  [-8; -18];
+  [-9; -19];
+  [-10; -20];
+  [-11; -21];
+  [-12; -22];
+  [-13; -23];
+  [-14; -24];
+  [-15; -25];
+  [-16; -11];
+  [-17; -12];
+  [-18; -13];
+  [-19; -14];
+  [-20; -15];
+  [-21; -16];
+  [-22; -17];
+  [-23; -18];
+  [-24; -19];
+  [-25; -20];
+  [1; 6; 11; 16; 21];
+  [2; 7; 12; 17; 22];
+  [3; 8; 13; 18; 23];
+  [4; 9; 14; 19; 24];
+  [5; 10; 15; 20; 25];
+]
+
+(* ---------- Test 6 ---------- *)
+(* Very complex UNSAT with 30 vars; build it algorithmically  *)
+
+let test6_num_vars = 30
+
+let test6_clauses =
+  let open List in
+  let all_16_to_30 =
+    [16;17;18;19;20;21;22;23;24;25;26;27;28;29;30]
+  in
+  let all_1_to_15 =
+    [1;2;3;4;5;6;7;8;9;10;11;12;13;14;15]
+  in
+  let clause1 = [1;2;3;4;5;6;7;8;9;10;11;12;13;14;15] in
+  let group1 =
+    (* -1..-15 with 16..30 *)
+    init 15 (fun k ->
+      let i = k + 1 in
+      (-i) :: all_16_to_30)
+  in
+  let group2 =
+    (* -16..-30 with 1..15 *)
+    init 15 (fun k ->
+      let i = 16 + k in
+      (-i) :: all_1_to_15)
+  in
+  let units =
+    let pos = init 30 (fun k -> [k + 1]) in
+    let neg = init 30 (fun k -> [-(k + 1)]) in
+    pos @ neg
+  in
+  clause1 :: (group1 @ group2 @ units)
+
+
+(* ========================================================= *)
+(*                     Test harness                          *)
+(* ========================================================= *)
+
+let print_result name num_vars clauses =
+  printf "=== %s ===\n" name;
+  match solve_sat num_vars clauses with
+  | None ->
+      printf "UNSAT\n\n"
+  | Some assignment ->
+      printf "SAT\n";
+      (* sort by variable index so it looks nice *)
+      let sorted = List.sort (fun (a,_) (b,_) -> compare a b) assignment in
+      List.iter
+        (fun (v, b) -> printf "%d=%b " v b)
+        sorted;
+      printf "\n\n"
+
+
+let () =
+  (* Known ground truth from your comments:
+     Test 1: SAT
+     Test 2: UNSAT
+     Test 3: UNSAT
+     Test 4: SAT
+     Test 5: SAT
+     Test 6: UNSAT
+  *)
+  print_result "Test 1" test1_num_vars test1_clauses;
+  print_result "Test 2" test2_num_vars test2_clauses;
+  print_result "Test 3" test3_num_vars test3_clauses;
+  print_result "Test 4" test4_num_vars test4_clauses;
+  print_result "Test 5" test5_num_vars test5_clauses;
+  print_result "Test 6" test6_num_vars test6_clauses
+
+Output:
+
+=== Test 1 ===
+SAT
+1=true 2=false 3=true 
+
+=== Test 2 ===
+UNSAT
+
+=== Test 3 ===
+UNSAT
+
+=== Test 4 ===
+SAT
+1=true 2=true 3=true 
+
+=== Test 5 ===
+SAT
+1=true 2=true 3=true 4=false 5=false 6=true 7=true 8=false 9=false 10=true 11=false 12=false 13=false 14=true 15=true 16=false 17=false 18=true 19=false 20=false 21=true 22=true 23=false 24=false 25=false 
+
+=== Test 6 ===
+UNSAT
+
