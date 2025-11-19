@@ -29,7 +29,6 @@ cdcl-sat-ocaml/
 │   ├── parser.ml       # DIMACS parsing & solution writing
 │   ├── sat_solver.ml   # CDCL core logic (OCaml port of sat_solver.py)
 │   ├── main.ml         # CLI wrapper (OCaml port of main.py)
-│   └── Makefile        # Simple build script using ocamlc
-└── tests/
-    └── input/
-        └── test_3.cnf  # Example UNSAT test
+└── test_run
+    └── main_run # Fully enclosed code with print wrapper and output testing
+       
